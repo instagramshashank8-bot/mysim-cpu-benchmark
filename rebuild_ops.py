@@ -7,6 +7,8 @@ from kerb_ops import kerb_geometry
 from source_fidelity import source_fidelity
 from drain_ops import drain_geometry
 from source_surface_ops import refine_source_surface
+from sign_panel_ops import sign_geometry
+from executable_mesh_program import execute_mesh_program
 
 def rebuild(obj,recipe,root):
  start=time.monotonic();original=obj.data;before={'vertices':len(original.vertices),'faces':len(original.polygons),'uv_layers':len(original.uv_layers),'bounds':list(obj.dimensions)};assert before['vertices']>2 and before['faces']>0,'Empty source'
@@ -16,13 +18,14 @@ def rebuild(obj,recipe,root):
   attribute=obj.data.attributes.new(name='source_polygon_id',type='INT',domain='FACE')
   for polygon in obj.data.polygons:attribute.data[polygon.index].value=polygon.index
   obj['validate_source_face_provenance']=True
- bm=bmesh.new();bm.from_mesh(obj.data);scale=max(max(obj.dimensions),.001);tolerance=min(.00001,scale*.000001)/max(max(abs(v) for v in obj.scale),1e-8)
- 
- if recipe.get('reconstruction_mode')!='source_surface_refinement':
-  bmesh.ops.remove_doubles(bm,verts=list(bm.verts),dist=tolerance);bmesh.ops.dissolve_degenerate(bm,edges=list(bm.edges),dist=tolerance*.1)
- bmesh.ops.recalc_face_normals(bm,faces=list(bm.faces));bm.to_mesh(obj.data);bm.free();obj.data.update()
+ scale=max(max(obj.dimensions),.001);tolerance=min(.00001,scale*.000001)/max(max(abs(v) for v in obj.scale),1e-8)
+ if recipe.get('reconstruction_mode')!='executable_mesh_program':
+  bm=bmesh.new();bm.from_mesh(obj.data)
+  if recipe.get('reconstruction_mode') not in ['source_surface_refinement','dedicated_sign_panel']:
+   bmesh.ops.remove_doubles(bm,verts=list(bm.verts),dist=tolerance);bmesh.ops.dissolve_degenerate(bm,edges=list(bm.edges),dist=tolerance*.1)
+  bmesh.ops.recalc_face_normals(bm,faces=list(bm.faces));bm.to_mesh(obj.data);bm.free();obj.data.update()
  bpy.ops.object.select_all(action='DESELECT');obj.select_set(True);bpy.context.view_layer.objects.active=obj
- category=recipe['category'];is_drain=category=='ground' and 'drain' in obj.name.lower();is_kerb=category=='ground' and any(t in obj.name.lower() for t in ['curb','kerb','ripple']);is_tyre=any(t in obj.name.lower() for t in ['tyre','tire']) and 'single' in obj.name.lower();source_refinement=recipe.get('reconstruction_mode')=='source_surface_refinement';component_changes=refine_source_surface(obj) if source_refinement else armco_geometry(obj) if category=='barrier' and 'armco' in obj.name.lower() else tyre_geometry(obj) if is_tyre else kerb_geometry(obj,recipe) if is_kerb else drain_geometry(obj,recipe) if is_drain else [];changes=['separate_original_collision_preserved',('source_connectivity_preserved_without_cross_surface_welding' if source_refinement else 'scale_aware_duplicate_and_degenerate_repair'),'consistent_surface_normals'];extras=[collision];changes.extend(component_changes)
+ category=recipe['category'];is_drain=category=='ground' and 'drain' in obj.name.lower();is_kerb=category=='ground' and any(t in obj.name.lower() for t in ['curb','kerb','ripple']);is_tyre=any(t in obj.name.lower() for t in ['tyre','tire']) and 'single' in obj.name.lower();source_refinement=recipe.get('reconstruction_mode') in ['source_surface_refinement','dedicated_sign_panel','executable_mesh_program'];component_changes=execute_mesh_program(obj,recipe) if recipe.get('reconstruction_mode')=='executable_mesh_program' else sign_geometry(obj,recipe) if recipe.get('reconstruction_mode')=='dedicated_sign_panel' else refine_source_surface(obj) if source_refinement else armco_geometry(obj) if category=='barrier' and 'armco' in obj.name.lower() else tyre_geometry(obj) if is_tyre else kerb_geometry(obj,recipe) if is_kerb else drain_geometry(obj,recipe) if is_drain else [];changes=['separate_original_collision_preserved',('source_connectivity_preserved_without_cross_surface_welding' if source_refinement else 'scale_aware_duplicate_and_degenerate_repair'),'consistent_surface_normals'];extras=[collision];changes.extend(component_changes)
  rebuilt_bm=bmesh.new();rebuilt_bm.from_mesh(obj.data);bmesh.ops.recalc_face_normals(rebuilt_bm,faces=list(rebuilt_bm.faces));nonmanifold=sum(not e.is_manifold for e in rebuilt_bm.edges);rebuilt_bm.to_mesh(obj.data);rebuilt_bm.free();assert nonmanifold==0,'Reconstructed component has nonmanifold edges';changes.append('closed_manifold_and_outward_normals_checked')
  # Surface thickness and road shape are never invented. Structural edges are dimensioned in world units.
  if not (source_refinement and recipe.get('preserve_source_front_edges')) and (category not in {'ground','grass','decal','vegetation','crowd'} or any(x in obj.name.lower() for x in ['curb','kerb','ripple','drain'])):
@@ -41,6 +44,8 @@ def rebuild(obj,recipe,root):
  assert len(obj.data.uv_layers)==before['uv_layers'],'UV layers lost'
  delta=max(abs(obj.dimensions[i]-before['bounds'][i]) for i in range(3));callback=recipe.get('_operator_progress_callback');callback(dict(stage='bounds_diagnostic',before_bounds=before['bounds'],after_bounds=list(obj.dimensions),delta=delta,relative_depth=obj.get('drain_relative_slot_depth'),source_normal=list(obj.get('drain_source_normal_world',[])))) if callback else None;assert delta<=max(.01,scale*.002),f'Silhouette bounds changed excessively: before={before["bounds"]}, after={list(obj.dimensions)}, delta={delta}'
  for poly in obj.data.polygons:assert 0<=poly.material_index<max(1,len(obj.data.materials)),'Material index out of range'
+ if recipe.get('review_full_views_follow_source_normal'):obj['review_full_views_follow_source_normal']=True
+ if recipe.get('source_fidelity_double_precision_origin'):obj['source_fidelity_double_precision_origin']=True
  fidelity=source_fidelity(obj,collision) if (is_kerb or is_drain or source_refinement) else None
  if fidelity:assert fidelity['source_profile_within_tolerance'],'Source surface distances exceed source-relative profile tolerance: '+str(fidelity)
  if source_refinement:assert fidelity['uv1_unambiguous_page_mismatches']==0,'Encoded UV1 page changed in source refinement'
@@ -70,7 +75,10 @@ def render_review(obj,extra,path,detail_only=False):
   light_tangent=review_normal.cross(Vector((0,0,1))) if abs(review_normal.z)<.9 else review_normal.cross(Vector((0,1,0)));light_tangent.normalize();lamp.location=centre+review_normal*radius*2+light_tangent*radius;lamp.rotation_euler=(centre-lamp.location).to_track_quat('-Z','Y').to_euler()
  camdata=bpy.data.cameras.new('Review camera');cam=bpy.data.objects.new('Review camera',camdata);scene.collection.objects.link(cam);scene.camera=cam;camdata.clip_start=radius*.001;camdata.clip_end=radius*100;camdata.type='ORTHO';camdata.ortho_scale=radius*1.5
  images=[]
- for i,direction in enumerate([] if detail_only else [(1,-1,.8),(-1,-1,.35),(0,0,2)]):
+ directions=[Vector((1,-1,.8)),Vector((-1,-1,.35)),Vector((0,0,2))]
+ if obj.get('review_full_views_follow_source_normal') and review_normal is not None:
+  front=review_normal.normalized();side=front.cross(Vector((0,0,1))) if abs(front.z)<.9 else front.cross(Vector((0,1,0)));side.normalize();up=front.cross(side).normalized();directions=[front+side*.45+up*.25,front-side*.45+up*.25,front]
+ for i,direction in enumerate([] if detail_only else directions):
   cam.location=centre+Vector(direction)*radius*2;cam.rotation_euler=(centre-cam.location).to_track_quat('-Z','Y').to_euler();scene.render.filepath=str(path.parent/(path.stem+f'-review-{i}.png'));bpy.ops.render.render(write_still=True);images.append(scene.render.filepath)
  # Close-up evidence complements full silhouettes of long, thin track assets.
  normal_matrix=obj.matrix_world.to_3x3().inverted().transposed()
